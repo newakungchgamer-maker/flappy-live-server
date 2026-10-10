@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: flappy-live-license-server
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: FLAPPY_ADMIN_KEY
+        sync: false
+      - key: SUPABASE_DATABASE_URL
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: DISCORD_REDIRECT_URI
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: DISCORD_LICENSE_ROLE_ID
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
