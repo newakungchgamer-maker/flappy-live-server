@@ -724,15 +724,29 @@ sealed class DiscordAuthService
     static string Hash(string value)
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
 
-    public static string CallbackPage(bool success, string message)
-    {
+        public static string CallbackPage(bool success, string message)
+        {
         string safeMessage = WebUtility.HtmlEncode(message);
-        string color = success ? "#5CFF6A" : "#FF6B6B";
-        return $"<!doctype html><html><head><meta charset='utf-8'><title>Flappy Live</title></head>" +
-            $"<body style='background:#092b3d;color:white;font-family:Arial;text-align:center;padding-top:20vh'>" +
-            $"<h1 style='color:{color}'>{safeMessage}</h1><p>ปิดหน้านี้แล้วกลับไปที่เกมได้เลย</p></body></html>";
-    }
-
+        string accent = success ? "#63ff70" : "#ff6b6b";
+        string icon = success ? "✓" : "!";
+        string title = success ? "LOGIN SUCCESS" : "LOGIN FAILED";
+        string hint = success ? "กลับไปที่เกมได้เลย" : "ตรวจสอบข้อมูลแล้วลองใหม่อีกครั้ง";
+        return $"<!doctype html><html lang='th'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Flappy Live</title>" +
+            "<style>" +
+            "*{box-sizing:border-box}html,body{min-height:100%;margin:0}" +
+            "body{display:flex;align-items:center;justify-content:center;padding:24px;background:#082b3d;color:#fff;font-family:'Trebuchet MS',Arial,sans-serif;" +
+            "background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:18px 18px}" +
+            ".card{position:relative;width:min(540px,100%);padding:42px 34px 34px;text-align:center;background:#0b3448;border:4px solid #061b28;box-shadow:8px 8px 0 #04151f, inset 0 0 0 3px #164b62, inset 0 0 28px rgba(0,0,0,.25)}" +
+            ".card:before,.card:after{content:'';position:absolute;width:22px;height:7px;background:#25c9eb;top:-7px}.card:before{left:24px}.card:after{right:24px;background:#ffd34a}" +
+            ".brand{font-size:14px;font-weight:900;letter-spacing:4px;color:#8feaff;margin-bottom:24px;text-shadow:3px 3px 0 #061b28}" +
+            ".icon{width:78px;height:78px;margin:0 auto 22px;display:flex;align-items:center;justify-content:center;border:4px solid #061b28;background:#123f52;color:var(--accent);font-size:48px;font-weight:900;line-height:1;box-shadow:6px 6px 0 #061b28, inset 0 0 0 3px var(--accent)}" +
+            "h1{margin:0 0 18px;color:var(--accent);font-size:clamp(26px,6vw,40px);letter-spacing:2px;text-shadow:3px 3px 0 #061b28}" +
+            ".message{margin:0 auto 10px;max-width:430px;font-size:18px;font-weight:700;line-height:1.55}.hint{margin:0 0 28px;color:#b9d8e3;font-size:15px}" +
+            "button{cursor:pointer;border:4px solid #061b28;background:#ffc52d;color:#342000;padding:13px 28px;font-size:17px;font-weight:900;letter-spacing:1px;box-shadow:5px 5px 0 #061b28;transition:transform .12s,filter .12s}button:hover{transform:translate(2px,2px);filter:brightness(1.12);box-shadow:3px 3px 0 #061b28}button:active{transform:translate(5px,5px);box-shadow:none}" +
+            ".foot{margin-top:30px;color:#6f9baa;font-size:11px;letter-spacing:2px}@media(max-width:420px){.card{padding:34px 20px 28px}.message{font-size:16px}}</style></head>" +
+            $"<body><main class='card' style='--accent:{accent}'><div class='brand'>FLAPPY LIVE</div><div class='icon'>{icon}</div>" +
+            $"<h1>{title}</h1><p class='message'>{safeMessage}</p><p class='hint'>{hint}</p><button onclick='window.close()'>กลับไปที่เกม</button><div class='foot'>DISCORD ROLE VERIFICATION</div></main></body></html>";
+        }
     sealed class PendingLogin
     {
         public string DeviceId { get; }
