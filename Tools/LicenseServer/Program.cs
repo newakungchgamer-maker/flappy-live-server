@@ -15,6 +15,8 @@ string adminKey = Environment.GetEnvironmentVariable("FLAPPY_ADMIN_KEY")
     ?? "change-this-admin-key";
 ILicenseStore store = CreateLicenseStore(storePath);
 DiscordAuthService? discordAuth = DiscordAuthService.TryCreate();
+CookieDiscordAuth? cookieAuth = CookieDiscordAuth.FromEnvironment();
+CookieDiscordAuth.Map(app, cookieAuth);
 
 app.MapGet("/health", () => Results.Ok(new { ok = true, service = "flappy-live-license-server" }));
 
@@ -73,6 +75,16 @@ app.MapGet("/api/v1/discord/login/start", (HttpRequest request) =>
 
 app.MapGet("/api/v1/discord/callback", async (HttpRequest request) =>
 {
+    string cookieState = request.Query["state"].ToString();
+    if (cookieState.StartsWith("cookie_", StringComparison.Ordinal))
+    {
+        var reply = cookieAuth == null
+            ? new CookieDiscordAuth.Reply(false, "unavailable", "CookieLive ยังไม่พร้อม")
+            : await cookieAuth.Callback(cookieState, request.Query["code"].ToString(), request.Query["error"].ToString());
+        request.HttpContext.Response.Headers.CacheControl = "no-store";
+        request.HttpContext.Response.Headers["Referrer-Policy"] = "no-referrer";
+        return Results.Content(CookieDiscordAuth.Page(reply), "text/html");
+    }
     if (discordAuth is null)
         return Results.Content(DiscordAuthService.CallbackPage(false, "Discord login ยังไม่ได้ตั้งค่าในเซิร์ฟเวอร์"), "text/html");
 
