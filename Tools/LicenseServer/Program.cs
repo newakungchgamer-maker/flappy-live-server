@@ -18,6 +18,21 @@ DiscordAuthService? discordAuth = DiscordAuthService.TryCreate();
 
 app.MapGet("/health", () => Results.Ok(new { ok = true, service = "flappy-live-license-server" }));
 
+// Public update metadata; never expose license, database or Discord settings.
+app.MapGet("/api/v1/releases/nt-live", (HttpResponse response) =>
+{
+    response.Headers.CacheControl = "no-store";
+    var version = Environment.GetEnvironmentVariable("NT_LIVE_LATEST_VERSION");
+    var downloadUrl = Environment.GetEnvironmentVariable("NT_LIVE_DOWNLOAD_URL");
+    var sha256 = Environment.GetEnvironmentVariable("NT_LIVE_SHA256");
+    if (!Version.TryParse(version, out _) ||
+        !Uri.TryCreate(downloadUrl, UriKind.Absolute, out var url) || url.Scheme != "https" ||
+        string.IsNullOrWhiteSpace(sha256) ||
+        !System.Text.RegularExpressions.Regex.IsMatch(sha256, @"\A[a-fA-F0-9]{64}\z"))
+        return Results.NotFound(new { error = "NT Live release has not been configured" });
+    return Results.Ok(new { version, downloadUrl = url.AbsoluteUri, sha256 = sha256.ToLowerInvariant() });
+});
+
 app.MapPost("/api/v1/licenses/activate", (ActivateRequest request) =>
 {
     LicenseResult result = store.Activate(request.Code, request.DeviceId);
