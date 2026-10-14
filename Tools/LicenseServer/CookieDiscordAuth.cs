@@ -11,7 +11,7 @@ public sealed class CookieDiscordAuth
     public const string Product = "cookielive", DefaultRole = "1559797818837962752";
     public record Options(string ClientId,string ClientSecret,string RedirectUri,string GuildId,string RoleId,string BotToken);
     public record Request(string? DeviceId,string? LoginId=null,string? PollToken=null,string? Token=null);
-    public record Reply(bool Ok,string State,string Message,string Product="cookielive",string? LoginId=null,string? PollToken=null,string? AuthorizationUrl=null,string? Token=null);
+    public record Reply(bool Ok,string State,string Message,string Product="cookielive",string? LoginId=null,string? PollToken=null,string? AuthorizationUrl=null,string? Token=null,string? OwnerId=null);
     sealed class Pending(string device,string pollHash,DateTimeOffset expiry)
     {
         public readonly string Device=device,PollHash=pollHash;
@@ -19,7 +19,7 @@ public sealed class CookieDiscordAuth
         public int Started;
         public Reply Result=new(true,"pending","รอยืนยันใน Discord");
     }
-    record Session(string User,string Device,DateTimeOffset Expiry);
+    record Session(string User,string Device,DateTimeOffset Expiry,DateTimeOffset VerifiedUntil);
     readonly ConcurrentDictionary<string,Pending> pending=new();
     readonly ConcurrentDictionary<string,Session> sessions=new();
     readonly Options options;
@@ -78,7 +78,7 @@ public sealed class CookieDiscordAuth
             else if(login.Expiry<=clock.GetUtcNow())result=Denied("รายการล็อกอินหมดอายุ กรุณาลองใหม่");
             else
             {
-                string token="cookie_"+Random(48);sessions[Hash(token)]=new(user,login.Device,clock.GetUtcNow().AddDays(30));
+                string token="cookie_"+Random(48);sessions[Hash(token)]=new(user,login.Device,clock.GetUtcNow().AddDays(30),clock.GetUtcNow().AddMinutes(5));
                 result=new(true,"approved","ยืนยันสิทธิ์ CookieLive แล้ว",Token:token);
             }
         }
@@ -92,7 +92,11 @@ public sealed class CookieDiscordAuth
         if(!Valid(request.Token) || !Valid(request.DeviceId) || !sessions.TryGetValue(Hash(request.Token!),out var session) || session.Device!=request.DeviceId || session.Expiry<=clock.GetUtcNow())return Denied("เซสชัน CookieLive หมดอายุ กรุณาล็อกอินใหม่");
         try
         {
-            if(await HasRole(session.User))return new(true,"approved","ยืนยันสิทธิ์ CookieLive แล้ว");
+            if(await HasRole(session.User))
+            {
+                sessions.TryUpdate(Hash(request.Token!),session with {VerifiedUntil=clock.GetUtcNow().AddMinutes(5)},session);
+                return new(true,"approved","ยืนยันสิทธิ์ CookieLive แล้ว",OwnerId:session.User);
+            }
             sessions.TryRemove(Hash(request.Token!),out _);return Denied("บัญชีนี้ไม่มี Role สำหรับ CookieLive แล้ว");
         }
         catch(Exception e) when(e is HttpRequestException or TaskCanceledException or JsonException or InvalidOperationException)
@@ -102,6 +106,13 @@ public sealed class CookieDiscordAuth
     {
         if(Valid(request.Token) && sessions.TryGetValue(Hash(request.Token!),out var session) && session.Device==request.DeviceId)sessions.TryRemove(Hash(request.Token!),out _);
         return new(true,"logged-out","ออกจากระบบแล้ว");
+    }
+    // Owner always comes from the authenticated session, never a client supplied Discord ID.
+    public async Task<string?> StatisticsOwner(string? token,string? device)
+    {
+        if(!Valid(token) || !Valid(device) || !sessions.TryGetValue(Hash(token!),out var s) || s.Device!=device || s.Expiry<=clock.GetUtcNow())return null;
+        if(s.VerifiedUntil>clock.GetUtcNow())return s.User;
+        var reply=await Validate(new(device,Token:token));return reply.Ok?reply.OwnerId:null;
     }
     async Task<bool> HasRole(string user)
     {

@@ -17,6 +17,7 @@ ILicenseStore store = CreateLicenseStore(storePath);
 DiscordAuthService? discordAuth = DiscordAuthService.TryCreate();
 CookieDiscordAuth? cookieAuth = CookieDiscordAuth.FromEnvironment();
 CookieDiscordAuth.Map(app, cookieAuth);
+CookieCloudStore.Map(app, cookieAuth);
 
 app.MapGet("/health", () => Results.Ok(new { ok = true, service = "flappy-live-license-server" }));
 
