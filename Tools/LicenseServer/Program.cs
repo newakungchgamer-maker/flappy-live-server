@@ -18,6 +18,7 @@ DiscordAuthService? discordAuth = DiscordAuthService.TryCreate();
 CookieDiscordAuth? cookieAuth = CookieDiscordAuth.FromEnvironment();
 CookieDiscordAuth.Map(app, cookieAuth);
 CookieCloudStore.Map(app, cookieAuth);
+CandyLicense.Map(app);
 
 app.MapGet("/health", () => Results.Ok(new { ok = true, service = "flappy-live-license-server" }));
 
