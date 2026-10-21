@@ -9,12 +9,16 @@ using NpgsqlTypes;
 
 // CandyLive entitlements are independent of all other products on this host.
 public record CandyEntitlement(string DiscordId, bool Active, DateTimeOffset? ExpiresAt, string Note);
+public record CandySession(string TokenHash, string DiscordId, string DeviceId, DateTimeOffset ExpiresAt);
 public interface ICandyLicenseStore
 {
     Task<CandyEntitlement?> Find(string id, CancellationToken ct);
     Task<IReadOnlyList<CandyEntitlement>> List(CancellationToken ct);
     Task Set(CandyEntitlement item, CancellationToken ct);
     Task<string> SigningKey(CancellationToken ct);
+    Task SaveSession(CandySession session, CancellationToken ct);
+    Task<CandySession?> FindSession(string tokenHash, CancellationToken ct);
+    Task RevokeSession(string tokenHash, string deviceId, CancellationToken ct);
 }
 
 public sealed class CandyLicenseStore : ICandyLicenseStore
@@ -56,6 +60,10 @@ public sealed class CandyLicenseStore : ICandyLicenseStore
                             expires_at timestamptz, note text NOT NULL, changed_at timestamptz NOT NULL DEFAULT now());
                         CREATE TABLE IF NOT EXISTS candylive_private.signing_keys (
                             id integer PRIMARY KEY CHECK(id=1), pem text NOT NULL);
+                        CREATE TABLE IF NOT EXISTS candylive_private.sessions (
+                            token_hash text PRIMARY KEY, discord_id text NOT NULL, device_id text NOT NULL,
+                            expires_at timestamptz NOT NULL, revoked boolean NOT NULL DEFAULT false);
+                        CREATE INDEX IF NOT EXISTS candy_sessions_owner ON candylive_private.sessions(discord_id);
                         REVOKE ALL ON ALL TABLES IN SCHEMA candylive_private FROM PUBLIC;
                         REVOKE ALL ON ALL SEQUENCES IN SCHEMA candylive_private FROM PUBLIC;
                         """, c);
@@ -92,11 +100,39 @@ public sealed class CandyLicenseStore : ICandyLicenseStore
             VALUES(@id,@active,@expires,@note) ON CONFLICT(discord_id) DO UPDATE
             SET active=excluded.active,expires_at=excluded.expires_at,note=excluded.note,updated_at=now();
             INSERT INTO candylive_private.audit(discord_id,active,expires_at,note) VALUES(@id,@active,@expires,@note);
+            UPDATE candylive_private.sessions SET revoked=true WHERE discord_id=@id AND @active=false;
             """, c, tx);
         cmd.Parameters.AddWithValue("id", item.DiscordId); cmd.Parameters.AddWithValue("active", item.Active);
         cmd.Parameters.AddWithValue("expires", NpgsqlDbType.TimestampTz, (object?)item.ExpiresAt ?? DBNull.Value);
         cmd.Parameters.AddWithValue("note", item.Note);
         await cmd.ExecuteNonQueryAsync(ct); await tx.CommitAsync(ct);
+    }
+    public async Task SaveSession(CandySession session, CancellationToken ct)
+    {
+        await using var c = await Open(ct); await using var tx = await c.BeginTransactionAsync(ct);
+        await using var cmd = new NpgsqlCommand("""
+            UPDATE candylive_private.sessions SET revoked=true WHERE discord_id=@id AND device_id=@device;
+            INSERT INTO candylive_private.sessions(token_hash,discord_id,device_id,expires_at) VALUES(@hash,@id,@device,@expires);
+            DELETE FROM candylive_private.sessions WHERE expires_at < now() - interval '1 day';
+            """, c, tx);
+        cmd.Parameters.AddWithValue("hash",session.TokenHash); cmd.Parameters.AddWithValue("id",session.DiscordId);
+        cmd.Parameters.AddWithValue("device",session.DeviceId); cmd.Parameters.AddWithValue("expires",session.ExpiresAt);
+        await cmd.ExecuteNonQueryAsync(ct); await tx.CommitAsync(ct);
+    }
+    public async Task<CandySession?> FindSession(string tokenHash, CancellationToken ct)
+    {
+        await using var c = await Open(ct);
+        await using var cmd = new NpgsqlCommand("SELECT discord_id,device_id,expires_at FROM candylive_private.sessions WHERE token_hash=@hash AND revoked=false",c);
+        cmd.Parameters.AddWithValue("hash",tokenHash);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        return await r.ReadAsync(ct) ? new(tokenHash,r.GetString(0),r.GetString(1),r.GetFieldValue<DateTimeOffset>(2)) : null;
+    }
+    public async Task RevokeSession(string tokenHash, string deviceId, CancellationToken ct)
+    {
+        await using var c = await Open(ct);
+        await using var cmd = new NpgsqlCommand("UPDATE candylive_private.sessions SET revoked=true WHERE token_hash=@hash AND device_id=@device",c);
+        cmd.Parameters.AddWithValue("hash",tokenHash); cmd.Parameters.AddWithValue("device",deviceId);
+        await cmd.ExecuteNonQueryAsync(ct);
     }
     public async Task<string> SigningKey(CancellationToken ct)
     {
@@ -129,6 +165,56 @@ public sealed class CandyLicense
     public record CheckRequest(string? Nonce);
     public record Reply(bool Ok, string Code, string Payload = "", string Signature = "", int RetryAfterSeconds = 0);
     public record Decision(int Status, Reply Body);
+    public record SessionRequest(string? Nonce, string? DeviceId);
+    public record SessionReply(bool Ok, string Code, string Payload="", string Signature="", int RetryAfterSeconds=0,
+        string SessionToken="", string UserId="", long SessionExpiresAt=0);
+    public record SessionDecision(int Status, SessionReply Body);
+    static bool SessionInputValid(SessionRequest? request) => request != null &&
+        Regex.IsMatch(request.Nonce ?? "", @"\A[a-f0-9]{32}\z") && Regex.IsMatch(request.DeviceId ?? "", @"\A[a-f0-9]{64}\z");
+    static bool SessionTokenValid(string? token) => Regex.IsMatch(token ?? "", @"\Acandy_[a-f0-9]{64}\z");
+    static string TokenHash(string token) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+    public async Task<SessionDecision> StartSession(string discordToken, SessionRequest? request, CancellationToken ct)
+    {
+        if(!SessionInputValid(request)) return new(400,new(false,"invalid-request"));
+        if(string.IsNullOrEmpty(discordToken)||discordToken.Length>2048||discordToken.Any(char.IsWhiteSpace)) return new(401,new(false,"invalid-session"));
+        var identity = await ResolveIdentity(discordToken,ct);
+        if(identity.Failure is Decision failure) return new(failure.Status,new(false,failure.Body.Code,RetryAfterSeconds:failure.Body.RetryAfterSeconds));
+        var purchase = await store.Find(identity.Value!.Owner,ct);
+        if(purchase==null||!purchase.Active) return new(403,new(false,"not-entitled"));
+        var now=clock.GetUtcNow();
+        if(purchase.ExpiresAt<=now) return new(403,new(false,"expired"));
+        string token="candy_"+Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        var session=new CandySession(TokenHash(token),purchase.DiscordId,request!.DeviceId!,now.AddDays(30));
+        await store.SaveSession(session,ct);
+        return await SessionLease(session,purchase,request.Nonce!,token,ct);
+    }
+    public async Task<SessionDecision> RenewSession(string token, SessionRequest? request, CancellationToken ct)
+    {
+        if(!SessionInputValid(request)) return new(400,new(false,"invalid-request"));
+        if(!SessionTokenValid(token)) return new(401,new(false,"invalid-session"));
+        var session=await store.FindSession(TokenHash(token),ct);
+        if(session==null||session.DeviceId!=request!.DeviceId||session.ExpiresAt<=clock.GetUtcNow()) return new(401,new(false,"invalid-session"));
+        var purchase=await store.Find(session.DiscordId,ct);
+        if(purchase==null||!purchase.Active) return new(403,new(false,"not-entitled"));
+        if(purchase.ExpiresAt<=clock.GetUtcNow()) return new(403,new(false,"expired"));
+        return await SessionLease(session,purchase,request.Nonce!,"",ct);
+    }
+    async Task<SessionDecision> SessionLease(CandySession session,CandyEntitlement purchase,string nonce,string token,CancellationToken ct)
+    {
+        var now=clock.GetUtcNow();
+        var end=now.AddHours(24);
+        if(purchase.ExpiresAt.HasValue && purchase.ExpiresAt.Value<end) end=purchase.ExpiresAt.Value;
+        if(session.ExpiresAt<end) end=session.ExpiresAt;
+        if(end<=now) return new(403,new(false,"expired"));
+        string payload=Convert.ToBase64String(Encoding.UTF8.GetBytes($"candylive-offline-v1\n{session.DiscordId}\n{session.DeviceId}\n{nonce}\n{now.ToUnixTimeSeconds()}\n{end.ToUnixTimeSeconds()}"));
+        using var rsa=RSA.Create(); rsa.ImportFromPem(await Key(ct));
+        string signature=Convert.ToBase64String(rsa.SignData(Encoding.UTF8.GetBytes(payload),HashAlgorithmName.SHA256,RSASignaturePadding.Pkcs1));
+        return new(200,new(true,"licensed",payload,signature,SessionToken:token,UserId:session.DiscordId,SessionExpiresAt:session.ExpiresAt.ToUnixTimeSeconds()));
+    }
+    public async Task EndSession(string token,string? device,CancellationToken ct)
+    {
+        if(SessionTokenValid(token)&&Regex.IsMatch(device??"",@"\A[a-f0-9]{64}\z")) await store.RevokeSession(TokenHash(token),device!,ct);
+    }
     public async Task<Decision> Check(string token, string? nonce, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(nonce) || !Regex.IsMatch(nonce, @"\A[a-f0-9]{32}\z"))
@@ -210,7 +296,7 @@ public sealed class CandyLicense
         try
         {
             using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
-            if (json.RootElement.TryGetProperty("retry_after", out var value) && value.TryGetDouble(out double seconds) && double.IsFinite(seconds))
+            if (json.RootElement.ValueKind==JsonValueKind.Object && json.RootElement.TryGetProperty("retry_after", out var value) && value.ValueKind==JsonValueKind.Number && value.TryGetDouble(out double seconds) && double.IsFinite(seconds))
                 delay = Math.Max(delay, seconds);
         }
         catch (JsonException) { }
@@ -259,6 +345,29 @@ public sealed class CandyLicense
             }
             await next(ctx);
         });
+        foreach(string operation in new[]{"start","renew","logout"})
+        {
+            string action=operation;
+            app.MapPost("/api/v1/candylive/session/"+action,async (HttpContext ctx)=>
+            {
+                if(service==null) return Results.Json(new SessionReply(false,"server-not-configured"),statusCode:503);
+                if(!await slots.WaitAsync(0)) {ctx.Response.Headers.RetryAfter="5";return Results.Json(new SessionReply(false,"server-busy",RetryAfterSeconds:5),statusCode:429);}
+                try
+                {
+                    if(ctx.Request.ContentLength>1024) return Results.StatusCode(413);
+                    var body=await ctx.Request.ReadFromJsonAsync<SessionRequest>(ctx.RequestAborted);
+                    string auth=ctx.Request.Headers.Authorization.ToString();
+                    string token=auth.StartsWith("Bearer ",StringComparison.Ordinal)?auth[7..]:"";
+                    if(action=="logout") {await service.EndSession(token,body?.DeviceId,ctx.RequestAborted);return Results.Ok(new{ok=true});}
+                    var result=action=="start"?await service.StartSession(token,body,ctx.RequestAborted):await service.RenewSession(token,body,ctx.RequestAborted);
+                    if(result.Body.RetryAfterSeconds>0) ctx.Response.Headers.RetryAfter=result.Body.RetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return Results.Json(result.Body,statusCode:result.Status);
+                }
+                catch(JsonException){return Results.StatusCode(400);}
+                catch(Exception ex){app.Logger.LogWarning("CANDY_SESSION_FAILED action={Action} type={Type}",action,ex.GetType().Name);return Results.Json(new SessionReply(false,"temporarily-unavailable"),statusCode:503);}
+                finally{slots.Release();}
+            });
+        }
         app.MapGet("/api/v1/candylive/public-key", async (HttpContext ctx) =>
         {
             ctx.Response.Headers.CacheControl = "no-store";
