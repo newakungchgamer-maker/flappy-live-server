@@ -131,7 +131,11 @@ public sealed class CandyLicense
         // Never accept a user-supplied Discord ID. Discord also confirms the app and scope.
         using var req = new HttpRequestMessage(HttpMethod.Get, "https://discord.com/api/v10/oauth2/@me");
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        req.Headers.UserAgent.ParseAdd("CandyLive/1.0 (+https://github.com/newakungchgamer-maker/flappy-live-server)");
+        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         using var result = await discord.SendAsync(req, ct);
+        if (!result.IsSuccessStatusCode)
+            Console.WriteLine($"CANDY_LICENSE_DISCORD_HTTP status={(int)result.StatusCode}");
         if (result.StatusCode == HttpStatusCode.Unauthorized || result.StatusCode == HttpStatusCode.Forbidden)
             return new(401, new(false, "invalid-session"));
         if (!result.IsSuccessStatusCode) return new(503, new(false, "temporarily-unavailable"));
@@ -221,8 +225,13 @@ public sealed class CandyLicense
                 var decision = await service.Check(auth.StartsWith("Bearer ", StringComparison.Ordinal) ? auth[7..] : "", body?.Nonce, ctx.RequestAborted);
                 return Results.Json(decision.Body, statusCode: decision.Status);
             }
-            catch (JsonException) { return Results.StatusCode(400); }
-            catch { return Results.Json(new Reply(false, "temporarily-unavailable"), statusCode: 503); }
+            catch (JsonException) { return Results.StatusCode(400); }    
+            catch (Exception ex)
+            {
+                // Log only the exception type: messages/bodies can contain credentials or personal data.
+                app.Logger.LogWarning("CANDY_LICENSE_CHECK_FAILED type={Type}", ex.GetType().Name);
+                return Results.Json(new Reply(false, "temporarily-unavailable"), statusCode: 503);
+            }
             finally { slots.Release(); }
         });
         app.MapGet("/candy/admin", () => Results.Content(CandyAdminPage.Html, "text/html; charset=utf-8"));
