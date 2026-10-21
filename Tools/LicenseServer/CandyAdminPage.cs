@@ -19,7 +19,7 @@ public static class CandyAdminPage
         <label for="expiry">วันหมดอายุ (เว้นว่าง = ไม่กำหนดวันหมดอายุ)</label><input id="expiry" type="datetime-local">
         <label for="note">หมายเหตุ / เลขคำสั่งซื้อ</label><input id="note" maxlength="300">
         <button id="grant">บันทึกสิทธิ์เล่น</button><button id="revoke" class="secondary">ถอนสิทธิ์</button>
-        <small>การถอนสิทธิ์มีผลกับเกมที่เปิดอยู่ภายในไม่เกิน 5 นาที</small></section>
+        <small>ขณะออนไลน์ เกมตรวจสิทธิ์ประมาณทุก 2 นาที · หากติดต่อเซิร์ฟเวอร์ไม่ได้ สิทธิ์สำรองเดิมอาจใช้ได้สูงสุด 24 ชั่วโมง และไม่เกินวันหมดอายุที่ซื้อไว้</small></section>
         <p id="status" role="status"></p><section><h2>ลูกค้าล่าสุด (สูงสุด 500 บัญชี)</h2><div id="list"></div></section>
         </main><script>
         const $=id=>document.getElementById(id);let busy=false;
