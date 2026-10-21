@@ -116,11 +116,18 @@ public sealed class CandyLicense
     readonly ICandyLicenseStore store;
     readonly HttpClient discord;
     readonly SemaphoreSlim signingGate = new(1);
+    readonly SemaphoreSlim identityGate = new(1);
+    readonly Dictionary<string, Identity> identities = new();
+    readonly TimeProvider clock;
+    DateTimeOffset retryAt;
+    int missingRetryBackoff = 60;
+    sealed record Identity(string Owner, DateTimeOffset Expires, DateTimeOffset VerifiedAt);
     string? signingPem;
-    public CandyLicense(ICandyLicenseStore store, HttpClient discord) { this.store = store; this.discord = discord; }
+    public CandyLicense(ICandyLicenseStore store, HttpClient discord, TimeProvider? clock = null)
+    { this.store = store; this.discord = discord; this.clock = clock ?? TimeProvider.System; }
     public static bool IdValid(string? s) => s != null && Regex.IsMatch(s, @"\A[0-9]{17,20}\z");
     public record CheckRequest(string? Nonce);
-    public record Reply(bool Ok, string Code, string Payload = "", string Signature = "");
+    public record Reply(bool Ok, string Code, string Payload = "", string Signature = "", int RetryAfterSeconds = 0);
     public record Decision(int Status, Reply Body);
     public async Task<Decision> Check(string token, string? nonce, CancellationToken ct)
     {
@@ -128,6 +135,38 @@ public sealed class CandyLicense
             return new(400, new(false, "invalid-request"));
         if (string.IsNullOrEmpty(token) || token.Length > 2048 || token.Any(char.IsWhiteSpace))
             return new(401, new(false, "invalid-session"));
+        var identityResult = await ResolveIdentity(token, ct);
+        if (identityResult.Failure != null) return identityResult.Failure;
+        var identity = identityResult.Value!;
+        string owner = identity.Owner;
+        // Purchases are never cached: a revocation still applies on every check.
+        var record = await store.Find(owner, ct);
+        if (record == null || !record.Active) return new(403, new(false, "not-entitled"));
+        var now = clock.GetUtcNow();
+        if (record.ExpiresAt <= now) return new(403, new(false, "expired"));
+        var end = identity.VerifiedAt.AddMinutes(5);
+        if (record.ExpiresAt.HasValue && record.ExpiresAt < end) end = record.ExpiresAt.Value;
+        if (identity.Expires < end) end = identity.Expires;
+        if (end <= now) return new(503, new(false, "temporarily-unavailable"));
+        string payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(
+            $"candylive-v1\n{owner}\n{nonce}\n{now.ToUnixTimeSeconds()}\n{end.ToUnixTimeSeconds()}"));
+        using var rsa = RSA.Create(); rsa.ImportFromPem(await Key(ct));
+        var sig = rsa.SignData(Encoding.UTF8.GetBytes(payload), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        return new(200, new(true, "licensed", payload, Convert.ToBase64String(sig)));
+    }
+    async Task<(Identity? Value, Decision? Failure)> ResolveIdentity(string token, CancellationToken ct)
+    {
+        // Only hashes and validated identity metadata are retained, never bearer tokens.
+        string tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+        await identityGate.WaitAsync(ct);
+        try
+        {
+        var now = clock.GetUtcNow();
+        foreach (var entry in identities.Where(x => x.Value.VerifiedAt.AddMinutes(4) <= now || x.Value.Expires <= now).ToArray())
+            identities.Remove(entry.Key);
+        if (identities.TryGetValue(tokenHash, out var cached)) return (cached, null);
+        if (now < retryAt)
+            return (null, new(429, new(false, "discord-rate-limited", RetryAfterSeconds: (int)Math.Ceiling((retryAt-now).TotalSeconds))));
         // Never accept a user-supplied Discord ID. Discord also confirms the app and scope.
         using var req = new HttpRequestMessage(HttpMethod.Get, "https://discord.com/api/v10/oauth2/@me");
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -136,9 +175,17 @@ public sealed class CandyLicense
         using var result = await discord.SendAsync(req, ct);
         if (!result.IsSuccessStatusCode)
             Console.WriteLine($"CANDY_LICENSE_DISCORD_HTTP status={(int)result.StatusCode}");
+        if (result.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            int seconds = await RetryDelay(result, now, missingRetryBackoff, ct);
+            missingRetryBackoff = Math.Min(900, missingRetryBackoff * 2);
+            retryAt = clock.GetUtcNow().AddSeconds(seconds);
+            Console.WriteLine($"CANDY_LICENSE_DISCORD_BACKOFF seconds={seconds}");
+            return (null, new(429, new(false, "discord-rate-limited", RetryAfterSeconds: seconds)));
+        }
         if (result.StatusCode == HttpStatusCode.Unauthorized || result.StatusCode == HttpStatusCode.Forbidden)
-            return new(401, new(false, "invalid-session"));
-        if (!result.IsSuccessStatusCode) return new(503, new(false, "temporarily-unavailable"));
+            return (null, new(401, new(false, "invalid-session")));
+        if (!result.IsSuccessStatusCode) return (null, new(503, new(false, "temporarily-unavailable")));
         using var json = JsonDocument.Parse(await result.Content.ReadAsStringAsync(ct));
         var root = json.RootElement;
         if (!root.TryGetProperty("application", out var app) || !app.TryGetProperty("id", out var appId) || appId.GetString() != ClientId ||
@@ -146,21 +193,28 @@ public sealed class CandyLicense
             !root.TryGetProperty("scopes", out var scopes) || scopes.ValueKind != JsonValueKind.Array ||
             !scopes.EnumerateArray().Any(s => s.GetString() == "identify") ||
             !root.TryGetProperty("expires", out var expires) || !DateTimeOffset.TryParse(expires.GetString(), out var tokenExpiry) ||
-            tokenExpiry <= DateTimeOffset.UtcNow)
-            return new(401, new(false, "invalid-session"));
-        string owner = id.GetString()!;
-        var record = await store.Find(owner, ct);
-        if (record == null || !record.Active) return new(403, new(false, "not-entitled"));
-        var now = DateTimeOffset.UtcNow;
-        if (record.ExpiresAt <= now) return new(403, new(false, "expired"));
-        var end = now.AddMinutes(5);
-        if (record.ExpiresAt.HasValue && record.ExpiresAt < end) end = record.ExpiresAt.Value;
-        if (tokenExpiry < end) end = tokenExpiry;
-        string payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(
-            $"candylive-v1\n{owner}\n{nonce}\n{now.ToUnixTimeSeconds()}\n{end.ToUnixTimeSeconds()}"));
-        using var rsa = RSA.Create(); rsa.ImportFromPem(await Key(ct));
-        var sig = rsa.SignData(Encoding.UTF8.GetBytes(payload), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        return new(200, new(true, "licensed", payload, Convert.ToBase64String(sig)));
+            tokenExpiry <= clock.GetUtcNow())
+            return (null, new(401, new(false, "invalid-session")));
+        var verified = new Identity(id.GetString()!, tokenExpiry, clock.GetUtcNow());
+        if (identities.Count >= 512) identities.Remove(identities.First().Key);
+        identities[tokenHash] = verified;
+        missingRetryBackoff = 60;
+        return (verified, null);
+        }
+        finally { identityGate.Release(); }
+    }
+    public static async Task<int> RetryDelay(HttpResponseMessage response, DateTimeOffset now, int fallback, CancellationToken ct)
+    {
+        double delay = response.Headers.RetryAfter?.Delta?.TotalSeconds ??
+            (response.Headers.RetryAfter?.Date - now)?.TotalSeconds ?? 0;
+        try
+        {
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+            if (json.RootElement.TryGetProperty("retry_after", out var value) && value.TryGetDouble(out double seconds) && double.IsFinite(seconds))
+                delay = Math.Max(delay, seconds);
+        }
+        catch (JsonException) { }
+        return delay > 0 ? (int)Math.Min(int.MaxValue - 1, Math.Ceiling(delay)) : fallback;
     }
     async Task<string> Key(CancellationToken ct)
     {
@@ -223,9 +277,11 @@ public sealed class CandyLicense
                 var body = await ctx.Request.ReadFromJsonAsync<CheckRequest>(ctx.RequestAborted);
                 string auth = ctx.Request.Headers.Authorization.ToString();
                 var decision = await service.Check(auth.StartsWith("Bearer ", StringComparison.Ordinal) ? auth[7..] : "", body?.Nonce, ctx.RequestAborted);
+                if (decision.Body.RetryAfterSeconds > 0)
+                    ctx.Response.Headers.RetryAfter = decision.Body.RetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 return Results.Json(decision.Body, statusCode: decision.Status);
             }
-            catch (JsonException) { return Results.StatusCode(400); }    
+            catch (JsonException) { return Results.StatusCode(400); }
             catch (Exception ex)
             {
                 // Log only the exception type: messages/bodies can contain credentials or personal data.
